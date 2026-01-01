@@ -6,10 +6,59 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 )
 
 const boardPath = "board.txt"
 const wordListPath = "words.txt"
+
+type Words struct {
+	mu       sync.RWMutex
+	wordList []string
+	wordMap  map[string]bool
+}
+
+func (w *Words) MarkAsFound(word string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.wordMap[word] = true
+}
+
+func (w *Words) HasPrefix(prefix string) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	for _, word := range w.wordList {
+		if strings.HasPrefix(word, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Words) Find(word string) (bool, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	v, ok := w.wordMap[word]
+	return v, ok
+}
+
+func (w *Words) FoundWords() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	foundWords := make([]string, 0)
+
+	for word, found := range w.wordMap {
+		if found {
+			foundWords = append(foundWords, word)
+		}
+	}
+
+	return foundWords
+}
 
 func main() {
 	args := os.Args[1:]
@@ -25,10 +74,17 @@ func main() {
 	}
 	defer fp.Close()
 
-	wordList, err := loadWordList()
+	wordMap, err := loadWordList()
 	if err != nil {
 		fmt.Printf("Failed to load words: %s\n", err)
 		return
+	}
+
+	wordList := make([]string, len(wordMap))
+	i := 0
+	for w := range wordMap {
+		wordList[i] = w
+		i++
 	}
 
 	board, err := loadBoard()
@@ -37,28 +93,29 @@ func main() {
 		return
 	}
 
-	foundWords := findWords(wordList, board)
+	words := &Words{
+		wordList: wordList,
+		wordMap:  wordMap,
+	}
+
+	findWords(words, board)
 
 	points := 0
 
-	words := make([]string, len(foundWords))
-	i := 0
-	for word := range foundWords {
+	foundWords := words.FoundWords()
+	for _, word := range foundWords {
 		if len(word) >= 8 {
 			points += 11
 		} else {
 			points += 1 + len(word) - 4
 		}
-
-		words[i] = word
-		i++
 	}
 
-	slices.SortFunc(words, func(a string, b string) int {
+	slices.SortFunc(foundWords, func(a string, b string) int {
 		return len(b) - len(a)
 	})
 
-	for _, word := range words {
+	for _, word := range foundWords {
 		fmt.Fprintf(fp, "%s", fmt.Sprintf("%s\n", word))
 	}
 
@@ -126,48 +183,53 @@ type Cell struct {
 	used   bool
 }
 
-func findWords(wordList map[string]bool, board Board) map[string]any {
-	foundWords := make(map[string]any)
+func deepCopyBoard(b Board) Board {
+	copyBoard := make(Board, len(b))
+	for i := range b {
+		copyBoard[i] = make([]Cell, len(b[i]))
+		copy(copyBoard[i], b[i])
+	}
+	return copyBoard
+}
+
+func findWords(words *Words, board Board) {
+	var wg sync.WaitGroup
 
 	for y, row := range board {
 		for x := range row {
-			scanFromPosition(wordList, board, &Position{x, y}, "", foundWords)
+			x, y := x, y
+			wg.Add(1)
+			go func(x int, y int, words *Words) {
+				defer wg.Done()
+				local := deepCopyBoard(board)
+				scanFromPosition(words, local, &Position{x, y}, "")
+			}(x, y, words)
 		}
 	}
 
-	return foundWords
+	wg.Wait()
 }
 
-func hasPrefix(words map[string]bool, prefix string) bool {
-	for w := range words {
-		if strings.HasPrefix(w, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func scanFromPosition(wordList map[string]bool, board Board, nextPos *Position, currentLetters string, foundWords map[string]any) {
+func scanFromPosition(words *Words, board Board, nextPos *Position, currentLetters string) {
 	board.MarkUsed(nextPos)
 	defer board.MarkUnused(nextPos)
 
 	currentLetters += board.Letter(nextPos)
 
-	if !hasPrefix(wordList, currentLetters) {
+	if !words.HasPrefix(currentLetters) {
 		return
 	}
 
-	alreadyFound, ok := wordList[currentLetters]
+	alreadyFound, ok := words.Find(currentLetters)
 
 	if ok && !alreadyFound {
-		wordList[currentLetters] = true
-		foundWords[currentLetters] = nil
+		words.MarkAsFound(currentLetters)
 	}
 
 	neightbors := board.ValidNeighbors(nextPos)
 
 	for _, n := range neightbors {
-		scanFromPosition(wordList, board, &n, currentLetters, foundWords)
+		scanFromPosition(words, board, &n, currentLetters)
 	}
 }
 
